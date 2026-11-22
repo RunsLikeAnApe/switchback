@@ -1,11 +1,14 @@
 import { clamp, distance, angle, wrap } from "./terrain.mjs";
 
+import { Field } from "./field.mjs";
+
 const gearRank = { laser: 4, lightning: 2, gun: 3, mortar: 1 };
 const up = (pos, height) => [pos[0], pos[1], pos[2] + height];
 export class Tactics {
   constructor(hello, terrain) {
     this.config = hello.config;
     this.map = terrain;
+    this.field = new Field(hello.config, hello.slot);
     this.slot = hello.slot;
     this.seed = hello.seed >>> 0;
     this.items = new Map();
@@ -14,6 +17,18 @@ export class Tactics {
     this.patrol = null;
   }
   remember(o) {
+    this.field.observe(o, this.map);
+    this.beamTimes ??= new Map();
+    for (const beam of o.beams || [])
+      if (beam.kind === "laser" && beam.by != null)
+        this.beamTimes.set(beam.by, o.t - (beam.age ?? 0));
+    for (const event of o.events || [])
+      if (
+        event.type === "damaged" &&
+        event.weapon === "laser" &&
+        event.by != null
+      )
+        this.beamTimes.set(event.by, o.t);
     let strongestHit = null;
     for (const event of o.events || []) {
       if (event.type !== "damaged") continue;
@@ -49,7 +64,13 @@ export class Tactics {
     const armed = beam || me.weapons.some((w) => w?.kind === "lightning");
     // When most of the field survives the opening, the next pursuer matters more than distant loot.
     const squadOpening =
-      o.t >= 23 && o.alive >= 15 && (armed || me.cubes >= 1 || o.t >= 36);
+      !this.field.ffa &&
+      o.t >= 14 &&
+      o.alive >= 13 &&
+      (this.field.watchers.some(
+        (a) => this.aggressors.has(a.id) && o.t - this.aggressors.get(a.id) < 3,
+      ) ||
+        (o.t >= 23 && (armed || me.cubes >= 1 || o.t >= 36)));
     if (squadOpening || o.t > 65 || (me.cubes >= 3 && beam) || o.alive < 9)
       this.equipped = true;
     return !this.equipped;
@@ -71,6 +92,9 @@ export class Tactics {
     let chosen = null,
       high = -Infinity;
     const preparing = this.preparing(o);
+    const duel = o.alive === 2;
+    const ffa = this.field.ffa && !duel;
+    const low = me.hp < me.max_hp * 0.67;
     for (const a of actors) {
       const d = distance(pos, a.pos);
       if (d > range + 8) continue;
@@ -96,7 +120,39 @@ export class Tactics {
         ? -((a.pos[0] - pos[0]) * a.vel[0] + (a.pos[1] - pos[1]) * a.vel[1]) /
           Math.max(1, d)
         : 0;
-      if (preparing && a.kind === "mech") {
+      const distracted = mech && ffa && this.field.distracted(o, a);
+      const urgent =
+        mech && (engaged || d < 55 || (a.charging && attention < 0.36));
+      const sideShot = mech && attention > 1.65;
+      const flimsy = a.hp < me.hp * (sideShot ? 0.78 : 0.55);
+      const freeShot =
+        (distracted && (wounded > 0.23 || hasBeam)) ||
+        (flimsy && (hasBeam || d < 125)) ||
+        (sideShot &&
+          hasBeam &&
+          !a.weapons?.includes("laser") &&
+          d > 95 &&
+          !low);
+      if (ffa && mech && !urgent && !freeShot) continue;
+      const healing =
+        me.hp < me.max_hp * 0.64 && o.t - this.field.lastDamage < 22;
+      const pest = this.field.pest;
+      if (
+        !duel &&
+        !mech &&
+        healing &&
+        !this.field.visible.length &&
+        !(a.kind === "npc" && pest?.id === a.id && o.t - pest.t < 4)
+      )
+        continue;
+      if (
+        ffa &&
+        !mech &&
+        (this.field.lastDanger > o.t - 2 ||
+          (low && o.t - this.field.lastDamage < 20 && a.kind !== "npc"))
+      )
+        continue;
+      if (!duel && !ffa && preparing && a.kind === "mech") {
         // While gathering gear, take a quick elimination or answer a gunner that is already hitting us.
         const canFinish = (hasBeam && wounded > 0.56) || wounded > 0.77;
         const underGunfire =
@@ -117,8 +173,21 @@ export class Tactics {
       }
       const hunting =
         engaged || a.charging || (attention < 0.42 && (toward > 1.5 || d < 75));
+      const soloHunt =
+        !preparing &&
+        !ffa &&
+        !duel &&
+        d < (hasBeam ? 170 : 135) &&
+        me.hp >= me.max_hp * 0.73 &&
+        this.field.visible.length <= 2 &&
+        (attention > 0.8 ||
+          (a.hp ?? Infinity) < me.hp ||
+          !a.weapons?.includes("laser"));
       if (
         a.kind === "mech" &&
+        !soloHunt &&
+        !duel &&
+        !ffa &&
         !hunting &&
         wounded < 0.38 &&
         o.alive > 4 &&
@@ -174,6 +243,12 @@ export class Tactics {
         score = (hasBeam ? 10 : 25) - d * 0.11;
         if (me.cubes >= 10) score -= 20;
       }
+      if (mech && duel) score += 1000;
+      if (mech && ffa)
+        score +=
+          (distracted ? 24 : 0) +
+          (freeShot ? 12 : 0) +
+          (urgent && d < 60 ? 24 : 0);
       if (score > high) {
         high = score;
         chosen = { a, d, z, engaged };
@@ -186,18 +261,30 @@ export class Tactics {
     )
       return null;
     if (chosen) this.lock = chosen.a.id;
+    if (chosen?.a.kind === "mech")
+      this.contact = { id: chosen.a.id, pos: [...chosen.a.pos], t: o.t };
     return chosen;
   }
   offense(o, target, action) {
     const me = o.self,
       yaw = me.aim[0];
     if (!target) {
+      const watch =
+        this.field.watchers[0] ??
+        (this.field.ffa ? this.field.visible[0] : null);
       action.aim =
         this.warning?.until > o.t
           ? [this.warning.yaw, 0]
-          : [wrap(yaw + 0.52), 0];
+          : watch
+            ? [angle(me.pos, watch.pos), 0]
+            : [wrap(yaw + 0.52), 0];
       action.reload = me.weapons.some(
-        (w) => w?.kind === "gun" && w.ammo < w.stats.mag * 0.8,
+        (w) =>
+          w?.kind === "gun" &&
+          w.reload <= 0 &&
+          (w.ammo === 0 ||
+            (o.t - this.field.lastContact > 1 &&
+              w.ammo <= w.stats.mag * (this.field.ffa ? 0.32 : 0.65))),
       );
       return;
     }
@@ -232,9 +319,22 @@ export class Tactics {
       ];
     };
     const beamAim = aimAfter(tickTime),
-      gunAim = aimAfter(
-        tickTime + Math.min(1.1, d / (gun?.stats.speed ?? 252)),
-      );
+      gunAim = (() => {
+        const rx = a.pos[0] - muzzle[0] + (vx - me.vel[0]) * tickTime;
+        const ry = a.pos[1] - muzzle[1] + (vy - me.vel[1]) * tickTime;
+        const speed = gun?.stats.speed ?? 252;
+        const approach = rx * vx + ry * vy,
+          closing = speed * speed - vx * vx - vy * vy;
+        const flight =
+          closing > 1
+            ? (approach +
+                Math.sqrt(
+                  approach * approach + closing * (rx * rx + ry * ry),
+                )) /
+              closing
+            : d / speed;
+        return aimAfter(tickTime + Math.min(1.1, flight));
+      })();
     const full = laser && laser.charge >= laser.stats.charge - 0.055;
     const cubeBonus =
       this.config.cubes.damage_per_cube *
@@ -333,7 +433,86 @@ export class Tactics {
       radius = Math.max(1, z[2]);
     if (distance(p, z) > Math.max(radius - 10, radius * 0.85))
       return { pos: z.slice(0, 2), urgent: true };
+    const duel = o.alive === 2;
+    if (duel && target?.a.kind === "mech")
+      return { opponent: true, pos: target.a.pos };
     const hasBeam = me.weapons.some((w) => w?.kind === "laser");
+    const field = this.field;
+    const weak = me.hp < me.max_hp * 0.64;
+    const snap = field.pressing.filter((a) => a.charging);
+    const thirdParty = field.ffa && field.watchers.length > 1;
+    const recover = weak && o.t - field.lastDamage < 22;
+    const cleanFinish =
+      target?.a.kind === "mech" && target.a.hp < (hasBeam ? 230 : 105);
+    if (
+      !duel &&
+      !cleanFinish &&
+      (thirdParty ||
+        snap.length ||
+        (recover && field.visible.length) ||
+        (field.ffa && !target && field.watchers.length))
+    ) {
+      const threats = thirdParty || !snap.length ? field.visible : snap;
+      const goal = field.shelter(o, this.map, z, threats);
+      if (goal) {
+        this.refuge = { ...goal, until: o.t + (weak ? 2.4 : 0.65) };
+        return goal;
+      }
+    }
+    if (
+      !duel &&
+      !field.visible.length &&
+      this.refuge?.until > o.t &&
+      distance(this.refuge.pos, z) < radius - 4
+    )
+      return this.refuge;
+    if (!duel && recover && !target && !field.visible.length && me.in_zone)
+      return { pos: p, rest: true };
+    if (
+      field.ffa &&
+      o.alive > 2 &&
+      o.t > 54 &&
+      hasBeam &&
+      me.cubes >= 5 &&
+      target?.a.kind !== "mech" &&
+      !field.watchers.length &&
+      !field.visible.some((a) => distance(a.pos, p) < 110) &&
+      o.t - field.lastDamage > 3 &&
+      !(o.projectiles || []).some((q) => distance(p, q.pos) < 30)
+    ) {
+      const forecast = this.zone(o, 22);
+      if (distance(p, forecast) < forecast[2] - 14) {
+        const here = this.map.key(...p),
+          top = this.map.roof[here];
+        if (
+          me.grounded &&
+          Math.abs(p[2] - top) < 1.5 &&
+          top - this.map.ground[here] >= 10
+        )
+          return { pos: p, rest: true, perched: true };
+        if (this.lookout && o.t >= this.lookout.until) {
+          this.avoidedRoof = { pos: this.lookout.goal.pos, until: o.t + 32 };
+          this.lookout = null;
+          this.nextLookout = o.t + 8;
+        }
+        if (!this.lookout && o.t >= (this.nextLookout ?? 0)) {
+          const goal = this.map.lookout(
+            p,
+            forecast,
+            me.energy,
+            me.stats,
+            this.avoidedRoof?.until > o.t ? this.avoidedRoof.pos : null,
+          );
+          this.nextLookout = o.t + 4;
+          if (goal) this.lookout = { goal, until: o.t + 14 };
+        }
+        if (
+          this.lookout &&
+          distance(this.lookout.goal.pos, forecast) < forecast[2] - 14
+        )
+          return this.lookout.goal;
+      }
+    }
     const preparing = this.preparing(o);
     let best = null,
       value = 0;
@@ -363,8 +542,18 @@ export class Tactics {
         (o.mechs || []).some(
           (a) => a.kind === "mech" && distance(a.pos, item.pos) < 50,
         );
+      if (
+        field.ffa &&
+        (d > (item.kind === "laser" ? 155 : 94) ||
+          (item.type === "cubes" && me.cubes >= this.config.cubes.stat_cap))
+      )
+        continue;
+      const risk = field.ffa ? field.lootRisk(item.pos) : 0;
+      if (risk > 0.9 && d > 12) continue;
       const utility =
-        (benefit * (unsafe ? 0.44 : 1)) / (16 + d + Math.max(0, height) * 2.6);
+        (benefit * (unsafe ? 0.44 : 1)) /
+        (1 + 3 * risk) /
+        (16 + d + Math.max(0, height) * 2.6);
       if (utility > value) {
         best = item;
         value = utility;
@@ -372,6 +561,16 @@ export class Tactics {
     }
     for (const drop of o.drops || []) {
       const d = distance(p, drop.pos);
+      const occupied = drop.holder != null && drop.holder !== this.slot;
+      if (
+        (occupied && target?.a.kind === "mech") ||
+        (!field.ffa &&
+          target?.a.kind === "mech" &&
+          (cleanFinish || (target.d < 110 && d > 48)))
+      )
+        continue;
+      if (field.ffa && (d > 100 || occupied || field.lootRisk(drop.pos) > 0.45))
+        continue;
       const utility =
         (me.hp < me.max_hp * 0.75 ? 190 : 85) /
         (20 + d + Math.max(0, drop.lands_in - d / 12) * 5);
@@ -397,6 +596,18 @@ export class Tactics {
       return best;
     if (target && target.a.kind === "mech")
       return { opponent: true, pos: target.a.pos };
+    if (
+      !target &&
+      !field.ffa &&
+      (duel || !preparing) &&
+      this.contact &&
+      !field.ownKills.has(this.contact.id) &&
+      o.t - this.contact.t < 3.5 &&
+      distance(p, this.contact.pos) > 22 &&
+      distance(this.contact.pos, z) < radius - 8 &&
+      (duel || me.hp > me.max_hp * 0.72)
+    )
+      return { pos: this.contact.pos };
     if (hasBeam && !target && me.in_zone && me.hp < me.max_hp * 0.84)
       return { pos: p, rest: true };
     if (
@@ -417,7 +628,8 @@ export class Tactics {
     // A roof needs clear air for takeoff. Charging into its wall can trap the mech under an eave.
     const me = o.self,
       p = me.pos;
-    if (!["pickups", "cubes", "crates"].includes(goal.type)) return goal;
+    if (!["pickups", "cubes", "crates", "lookout"].includes(goal.type))
+      return goal;
     const top = goal.pos[2],
       cell = this.map.key(...goal.pos);
     if (Math.abs(this.map.roof[cell] - top) > 2 || !Number.isFinite(top))
@@ -427,7 +639,7 @@ export class Tactics {
     if (this.ascent?.id !== goal.id) {
       this.ascent = {
         id: goal.id,
-        edge: this.map.roofApproach(p, goal.pos),
+        edge: goal.edge ?? this.map.roofApproach(p, goal.pos),
         active: false,
       };
     }
@@ -472,14 +684,22 @@ export class Tactics {
       d = target?.d ?? 999;
     let desired,
       boost = false;
-    if (goal.rest) {
+    if (
+      goal.rest ||
+      (goal.shelter &&
+        distance(p, goal.pos) < 3 &&
+        !threat &&
+        !(o.projectiles || []).length)
+    ) {
       action.move = [0, 0];
       return;
     }
     if (
       goal.capture &&
       distance(p, goal.pos) < goal.radius * 0.62 &&
-      !goal.lands_in
+      !goal.lands_in &&
+      !this.field.pressing.some((a) => distance(a.pos, p) < 65) &&
+      !(o.projectiles || []).some((shot) => distance(shot.pos, p) < 27)
     ) {
       action.move = [0, 0];
       return;
@@ -487,8 +707,36 @@ export class Tactics {
     if (goal.opponent) {
       const base = angle(target.a.pos, p),
         side = Math.sin((this.seed % 20) + o.t * 0.92) > 0 ? 1 : -1;
-      const optimal = me.weapons.some((w) => w?.kind === "laser") ? 205 : 162;
-      const radial = clamp((optimal - d) / 22, -0.5, 3.4),
+      const beam = me.weapons.some((w) => w?.kind === "laser");
+      const arc = me.weapons.find((w) => w?.kind === "lightning");
+      const enemyArc = target.a.weapons?.includes("lightning");
+      // A gun needs a shorter flight against a moving pilot. With a laser
+      // advantage we can instead trade from beyond an accurate gun burst.
+      let optimal = beam
+        ? target.a.weapons?.includes("laser")
+          ? 152
+          : 188
+        : target.a.weapons?.includes("laser")
+          ? 82
+          : 108;
+      if (arc && !beam && !enemyArc && target.a.hp < me.hp * 0.85)
+        optimal = arc.stats.range * 0.83;
+      if (enemyArc)
+        optimal = Math.max(optimal, this.config.weapons.lightning.range + 19);
+      const recentlyFired =
+        o.t - (this.beamTimes.get(target.a.id) ?? -100) < 0.9;
+      const safeToClose =
+        recentlyFired &&
+        d > 104 &&
+        me.hp > me.max_hp * 0.52 &&
+        !(o.mechs || []).some(
+          (a) =>
+            a.kind === "mech" &&
+            a.id !== target.a.id &&
+            distance(p, a.pos) < 105,
+        );
+      const preferred = safeToClose ? Math.min(optimal, 135) : optimal;
+      const radial = clamp((preferred - d) / 24, beam ? -0.8 : -1.6, 3.4),
         offset = Math.atan2(side, radial);
       desired = base + offset;
       boost =
@@ -507,6 +755,33 @@ export class Tactics {
         action.jump = true;
         boost = true;
         desired = angle(p, goal.pos);
+      }
+    }
+    let crossing = null;
+    if (
+      threat &&
+      target.a.charging &&
+      Math.abs(wrap(angle(target.a.pos, p) - target.a.aim[0])) < 0.32
+    ) {
+      if (
+        this.chargeTrack?.id !== target.a.id ||
+        o.t - this.chargeTrack.seen > 0.22
+      ) {
+        const yaw = angle(target.a.pos, p),
+          lateral = -Math.sin(yaw) * me.vel[0] + Math.cos(yaw) * me.vel[1];
+        const side =
+          Math.abs(lateral) > 1
+            ? Math.sign(lateral)
+            : Math.sin(desired - yaw) >= 0
+              ? 1
+              : -1;
+        this.chargeTrack = { id: target.a.id, start: o.t, side };
+      }
+      this.chargeTrack.seen = o.t;
+      if (o.t - this.chargeTrack.start >= 0.28 && d < 205 && me.energy > 18) {
+        crossing =
+          angle(target.a.pos, p) + (this.chargeTrack.side * Math.PI) / 2;
+        boost = true;
       }
     }
     const guard = this.zone(o, 2);
@@ -560,6 +835,8 @@ export class Tactics {
         );
         utility -= Math.max(0, 5 - miss) * clamp(1.5 - time, 0.5, 1.5);
       }
+      if (crossing !== null && !goal.urgent && !goal.shelter)
+        utility += 3.2 * Math.cos(dir - crossing);
       if (threat && target.a.charging)
         utility += 0.8 * Math.abs(Math.sin(dir - angle(p, target.a.pos)));
       if (utility > high) {
@@ -567,9 +844,32 @@ export class Tactics {
         best = dir;
       }
     }
-    action.move = [Math.cos(best), Math.sin(best)];
-    action.boost = boost;
-    if (threat && target.a.charging && d < 190 && me.grounded && me.energy > 30)
+    const quiet =
+      this.field.ffa &&
+      !goal.urgent &&
+      !goal.opponent &&
+      !goal.shelter &&
+      o.alive > 2 &&
+      !threat &&
+      !nearMisses.length &&
+      this.field.pressing.length === 0 &&
+      o.t - this.field.lastDamage > 3 &&
+      this.field.visible.length > 0 &&
+      me.grounded &&
+      !action.jump &&
+      distance(p, goal.pos) < 30;
+    const speed = quiet
+      ? Math.min(1, (0.92 * this.config.sound.step_speed) / me.stats.walk_speed)
+      : 1;
+    action.move = [Math.cos(best) * speed, Math.sin(best) * speed];
+    action.boost = quiet ? false : boost;
+    if (
+      crossing !== null &&
+      o.t - this.chargeTrack.start > 0.48 &&
+      d < 170 &&
+      me.grounded &&
+      me.energy > 40
+    )
       action.jump = true;
     if (!this.map.open(p, best, 3.5) && me.energy > 50) {
       action.jump = true;
@@ -580,8 +880,13 @@ export class Tactics {
     this.remember(o);
     const action = { tick: o.tick, fire: [false, false] },
       target = this.chooseTarget(o);
-    this.offense(o, target, action);
     const goal = this.destination(o, target);
+    const overlook = goal.perched || goal.type === "lookout";
+    this.offense(
+      o,
+      overlook && target?.a.kind !== "mech" ? null : target,
+      action,
+    );
     this.move(o, target, goal, action);
     if (
       this.preparing(o) &&

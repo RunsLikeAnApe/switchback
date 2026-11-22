@@ -42,6 +42,10 @@ export class Terrain {
     this.cols = Math.ceil((map.bounds.maxX - this.x0) / this.cell) + 1;
     this.rows = Math.ceil((map.bounds.maxY - this.y0) / this.cell) + 1;
     const count = this.cols * this.rows;
+    this.solids = map.prisms;
+    this.solidsByCell = new Array(count);
+    this.raySeen = new Uint32Array(this.solids.length);
+    this.raySequence = 0;
     this.ground = new Float32Array(count);
     this.bottom = new Float32Array(count).fill(Infinity);
     this.roof = new Float32Array(count).fill(-Infinity);
@@ -62,7 +66,8 @@ export class Terrain {
       this.ground[i] =
         buf.readInt16LE(2 * (row * terrain.nx + col)) * terrain.scale;
     }
-    for (const { ring, holes, top, base } of map.prisms) {
+    for (const [index, solid] of map.prisms.entries()) {
+      const { ring, holes, top, base } = solid;
       const xs = ring.filter((_, i) => !(i % 2)),
         ys = ring.filter((_, i) => i % 2);
       const first = this.key(Math.min(...xs) - 3, Math.min(...ys) - 3);
@@ -75,6 +80,7 @@ export class Terrain {
         for (let col = first % this.cols; col <= last % this.cols; col++) {
           const i = row * this.cols + col,
             [x, y] = this.point(i);
+          (this.solidsByCell[i] ??= []).push(index);
           if (
             ![
               [0, 0],
@@ -106,7 +112,6 @@ export class Terrain {
     // Geometry is static. Build the legal steps once, before the first observation.
     this.edges = new Int32Array(count * neighbors.length);
     this.edgeStart = new Int32Array(count + 1);
-    this.queue = new Int32Array(count);
     let edge = 0;
     for (let i = 0; i < count; i++) {
       this.edgeStart[i] = edge;
@@ -140,20 +145,63 @@ export class Terrain {
       this.y0 + Math.floor(i / this.cols) * this.cell,
     ];
   }
+  // Clip the sight line to the solid's vertical interval before checking its footprint.
+  crossesSolid(from, to, solid) {
+    const dx = to[0] - from[0],
+      dy = to[1] - from[1],
+      dz = to[2] - from[2];
+    let enter = 0,
+      exit = 1;
+    if (Math.abs(dz) < 1e-8) {
+      if (from[2] <= solid.base || from[2] >= solid.top) return false;
+    } else {
+      const t0 = (solid.base - from[2]) / dz,
+        t1 = (solid.top - from[2]) / dz;
+      enter = Math.max(0, Math.min(t0, t1));
+      exit = Math.min(1, Math.max(t0, t1));
+      if (enter >= exit) return false;
+    }
+    const x = from[0] + dx * enter,
+      y = from[1] + dy * enter;
+    if (
+      inside(x, y, solid.ring) &&
+      !(solid.holes || []).some((h) => inside(x, y, h))
+    )
+      return true;
+    const intersects = (ring) => {
+      for (let i = 0, j = ring.length - 2; i < ring.length; j = i, i += 2) {
+        const ex = ring[i] - ring[j],
+          ey = ring[i + 1] - ring[j + 1],
+          cross = dx * ey - dy * ex;
+        if (Math.abs(cross) < 1e-9) continue;
+        const ox = ring[j] - from[0],
+          oy = ring[j + 1] - from[1];
+        const t = (ox * ey - oy * ex) / cross,
+          u = (ox * dy - oy * dx) / cross;
+        if (t >= enter && t <= exit && u >= 0 && u <= 1) return true;
+      }
+      return false;
+    };
+    return intersects(solid.ring) || (solid.holes || []).some(intersects);
+  }
   visible(from, to) {
     const steps = Math.max(1, Math.ceil(distance(from, to) / 3.5));
-    for (let j = 1; j < steps; j++) {
-      const f = j / steps,
-        i = this.key(
-          from[0] + (to[0] - from[0]) * f,
-          from[1] + (to[1] - from[1]) * f,
-        );
-      const z = from[2] + (to[2] - from[2]) * f;
-      if (
-        this.ground[i] > z + 0.3 ||
-        (this.roof[i] > z + 0.2 && this.bottom[i] < z - 0.2)
-      )
-        return false;
+    const seq = ++this.raySequence;
+    for (let j = 0; j <= steps; j++) {
+      const frac = j / steps;
+      const cell = this.key(
+        from[0] + (to[0] - from[0]) * frac,
+        from[1] + (to[1] - from[1]) * frac,
+      );
+      const z = from[2] + (to[2] - from[2]) * frac;
+      if (j > 0 && j < steps && this.ground[cell] > z + 0.3) return false;
+      const solids = this.solidsByCell[cell];
+      if (!solids) continue;
+      for (const index of solids) {
+        if (this.raySeen[index] === seq) continue;
+        this.raySeen[index] = seq;
+        if (this.crossesSolid(from, to, this.solids[index])) return false;
+      }
     }
     return true;
   }
@@ -175,6 +223,66 @@ export class Terrain {
       height = Math.max(floor, height - 1.2);
     }
     return true;
+  }
+  lookout(pos, zone, energy, stats, avoid) {
+    // Choose a broad, reachable roof in the predicted safe area. Check
+    // interior cells so the resting point is back from the exposed lip.
+    const start = this.key(...pos),
+      col = start % this.cols,
+      row = Math.floor(start / this.cols);
+    const fuelHeight = Math.min(
+      34,
+      (Math.max(0, energy - 18) * stats.max_rise_speed) / stats.jet_drain,
+    );
+    let point = null,
+      cost = Infinity;
+    for (
+      let y = Math.max(1, row - 10);
+      y <= Math.min(this.rows - 2, row + 10);
+      y += 2
+    ) {
+      for (
+        let x = Math.max(1, col - 10);
+        x <= Math.min(this.cols - 2, col + 10);
+        x += 2
+      ) {
+        const cell = y * this.cols + x,
+          top = this.roof[cell],
+          height = top - this.ground[cell];
+        if (
+          !Number.isFinite(top) ||
+          height < 11 ||
+          top - pos[2] > fuelHeight ||
+          top - pos[2] < 3 ||
+          [1, -1, this.cols, -this.cols].some(
+            (n) => Math.abs(this.roof[cell + n] - top) > 1.5,
+          )
+        )
+          continue;
+        const p = [...this.point(cell), top],
+          d = distance(pos, p);
+        if (
+          d > 55 ||
+          distance(p, zone) > zone[2] - 14 ||
+          (avoid && distance(p, avoid) < 18)
+        )
+          continue;
+        const score = d + 0.65 * (top - pos[2]) - Math.min(height, 25) * 0.45;
+        if (score < cost) {
+          point = p;
+          cost = score;
+        }
+      }
+    }
+    if (!point) return null;
+    const edge = this.roofApproach(pos, point);
+    if (!edge || distance(pos, edge.launch) > 65) return null;
+    return {
+      id: "roof-" + this.key(...point),
+      type: "lookout",
+      pos: point,
+      edge,
+    };
   }
   roofApproach(pos, target) {
     const start = this.key(...target),
@@ -264,51 +372,59 @@ export class Terrain {
     }
     return key;
   }
-  field(target) {
+  field(target, start) {
     const goal = this.nearestOpen(this.key(...target));
-    if (this.routes.has(goal)) return this.routes.get(goal);
-    const costs = new Int16Array(this.wall.length).fill(-1),
-      q = this.queue;
-    let head = 0,
-      tail = 1;
-    q[0] = goal;
-    costs[goal] = 0;
-    while (head < tail) {
-      const i = q[head++];
-      for (let e = this.edgeStart[i]; e < this.edgeStart[i + 1]; e++) {
-        const next = this.edges[e];
-        if (costs[next] >= 0) continue;
-        costs[next] = costs[i] + 1;
-        q[tail++] = next;
-      }
+    let search = this.routes.get(goal);
+    if (!search) {
+      if (this.routes.size >= 12)
+        this.routes.delete(this.routes.keys().next().value);
+      const costs = new Int16Array(this.wall.length).fill(-1);
+      const queue = new Int32Array(this.wall.length);
+      costs[goal] = 0;
+      queue[0] = goal;
+      search = { costs, queue, head: 0, tail: 1 };
+      this.routes.set(goal, search);
     }
-    if (this.routes.size >= 12)
-      this.routes.delete(this.routes.keys().next().value);
-    this.routes.set(goal, costs);
+    const { costs, queue } = search;
+    // Once the start is reached, every cheaper step on its route already has a distance.
+    if (start === undefined || costs[start] < 0) {
+      let { head, tail } = search;
+      while (head < tail) {
+        const cell = queue[head++];
+        for (
+          let edge = this.edgeStart[cell];
+          edge < this.edgeStart[cell + 1];
+          edge++
+        ) {
+          const next = this.edges[edge];
+          if (costs[next] >= 0) continue;
+          costs[next] = costs[cell] + 1;
+          queue[tail++] = next;
+        }
+        if (start !== undefined && costs[start] >= 0) break;
+      }
+      search.head = head;
+      search.tail = tail;
+    }
     return costs;
   }
   heading(pos, target) {
     const direct = angle(pos, target),
       range = distance(pos, target);
     if (this.open(pos, direct, Math.min(range, 20))) return direct;
-    const dist = this.field(target),
-      start = this.nearestOpen(this.key(...pos));
+    const start = this.nearestOpen(this.key(...pos)),
+      dist = this.field(target, start);
     let cell = start;
     for (let k = 0; k < 4; k++) {
       let best = cell,
         bestCost = Infinity;
-      for (const [dx, dy] of neighbors) {
-        const next = cell + dx + dy * this.cols;
-        if (
-          next < 0 ||
-          next >= dist.length ||
-          dist[next] < 0 ||
-          dist[next] >= dist[cell] ||
-          (dx &&
-            dy &&
-            (this.wall[cell + dx] || this.wall[cell + dy * this.cols]))
-        )
-          continue;
+      for (
+        let edge = this.edgeStart[cell];
+        edge < this.edgeStart[cell + 1];
+        edge++
+      ) {
+        const next = this.edges[edge];
+        if (dist[next] < 0 || dist[next] >= dist[cell]) continue;
         const score =
           dist[next] +
           this.clearance[next] * 0.05 +
