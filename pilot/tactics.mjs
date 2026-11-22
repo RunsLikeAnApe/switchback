@@ -74,9 +74,17 @@ export class Tactics {
           Math.max(1, d)
         : 0;
       if (preparing && a.kind === "mech") {
-        const shortRange = d < 48 || (d < 92 && a.charging);
+        // While gathering gear, take a quick elimination or answer a gunner that is already hitting us.
+        const canFinish = (hasBeam && wounded > 0.56) || wounded > 0.77;
+        const underGunfire =
+          engaged &&
+          d < 170 &&
+          !a.weapons?.includes("laser") &&
+          (me.hp < me.max_hp * 0.75 || (attention < 0.22 && d < 96));
+        const shouldEngage =
+          d < 48 || (d < 92 && a.charging) || canFinish || underGunfire;
         if (
-          !shortRange &&
+          !shouldEngage &&
           !(
             engaged &&
             (me.hp < me.max_hp * 0.57 || a.weapons?.includes("laser"))
