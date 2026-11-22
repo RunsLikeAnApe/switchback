@@ -14,9 +14,19 @@ export class Tactics {
     this.patrol = null;
   }
   remember(o) {
-    for (const hit of o.events || [])
-      if (hit.type === "damaged" && hit.by != null)
-        this.aggressors.set(hit.by, o.t);
+    let strongestHit = null;
+    for (const event of o.events || []) {
+      if (event.type !== "damaged") continue;
+      if (event.by != null) this.aggressors.set(event.by, o.t);
+      if (
+        event.weapon !== "npc" &&
+        Number.isFinite(event.bearing) &&
+        (!strongestHit || event.amount > strongestHit.amount)
+      )
+        strongestHit = event;
+    }
+    if (strongestHit)
+      this.warning = { yaw: strongestHit.bearing, until: o.t + 1.15 };
     for (const type of ["pickups", "cubes", "crates"])
       for (const obj of o[type] || [])
         this.items.set(obj.id, { ...obj, type, time: o.t });
@@ -36,7 +46,11 @@ export class Tactics {
     const me = o.self;
     if (this.equipped) return false;
     const beam = me.weapons.some((w) => w?.kind === "laser");
-    if (o.t > 65 || (me.cubes >= 3 && beam) || o.alive < 9)
+    const armed = beam || me.weapons.some((w) => w?.kind === "lightning");
+    // When most of the field survives the opening, the next pursuer matters more than distant loot.
+    const squadOpening =
+      o.t >= 23 && o.alive >= 15 && (armed || me.cubes >= 1 || o.t >= 36);
+    if (squadOpening || o.t > 65 || (me.cubes >= 3 && beam) || o.alive < 9)
       this.equipped = true;
     return !this.equipped;
   }
@@ -60,9 +74,18 @@ export class Tactics {
     for (const a of actors) {
       const d = distance(pos, a.pos);
       if (d > range + 8) continue;
-      const z = a.kind === "mech" ? 4.6 : a.kind === "npc" ? 1.9 : 1.25,
-        center = up(a.pos, z);
-      if (!this.map.visible(muzzle, center)) continue;
+      const mech = a.kind === "mech";
+      const height = mech
+        ? this.config.mech.height *
+          (1 + (a.cubes ?? 0) * this.config.cubes.size_per_cube)
+        : a.kind === "npc"
+          ? 3.8
+          : 2.5;
+      let z = height * 0.5;
+      if (!this.map.visible(muzzle, up(a.pos, z))) {
+        z = height * 0.84;
+        if (!mech || !this.map.visible(muzzle, up(a.pos, z))) continue;
+      }
       const wounded =
         a.kind === "mech"
           ? 1 - clamp((a.hp ?? 1400) / (a.max_hp || 1400), 0, 1)
@@ -156,6 +179,12 @@ export class Tactics {
         chosen = { a, d, z, engaged };
       }
     }
+    if (
+      chosen?.a.kind !== "mech" &&
+      this.warning?.until > o.t &&
+      Math.abs(wrap(this.warning.yaw - me.aim[0])) > 0.7
+    )
+      return null;
     if (chosen) this.lock = chosen.a.id;
     return chosen;
   }
@@ -163,7 +192,10 @@ export class Tactics {
     const me = o.self,
       yaw = me.aim[0];
     if (!target) {
-      action.aim = [wrap(yaw + 0.52), 0];
+      action.aim =
+        this.warning?.until > o.t
+          ? [this.warning.yaw, 0]
+          : [wrap(yaw + 0.52), 0];
       action.reload = me.weapons.some(
         (w) => w?.kind === "gun" && w.ammo < w.stats.mag * 0.8,
       );
@@ -172,53 +204,106 @@ export class Tactics {
     const { a, d, z } = target;
     const laser = me.weapons.find((w) => w?.kind === "laser"),
       gun = me.weapons.find((w) => w?.kind === "gun");
-    const beamDue =
+    // Charging slows movement, so only use the laser on a drone we can safely collect.
+    const allowBeam =
+      a.kind !== "npc" ||
+      (d <= 55 &&
+        me.hp > 0.75 * me.max_hp &&
+        !(o.mechs || []).some(
+          (other) => other.kind === "mech" && distance(me.pos, other.pos) < 110,
+        ));
+    const tickTime = 1 / Math.max(1, this.config.match.tick_hz);
+    const vx = a.vel?.[0] ?? 0,
+      vy = a.vel?.[1] ?? 0,
+      vz = a.vel?.[2] ?? 0;
+    const muzzle = up(me.pos, me.stats.muzzle_height);
+    const aimAfter = (delay) => {
+      const x = a.pos[0] + vx * delay - (muzzle[0] + me.vel[0] * tickTime);
+      const y = a.pos[1] + vy * delay - (muzzle[1] + me.vel[1] * tickTime);
+      const vertical = vz * Math.min(delay, 0.25);
+      const dz = a.pos[2] + z + vertical - muzzle[2] - me.vel[2] * tickTime;
+      return [
+        Math.atan2(y, x),
+        clamp(
+          Math.atan2(dz, Math.hypot(x, y)),
+          me.stats.min_pitch,
+          me.stats.max_pitch,
+        ),
+      ];
+    };
+    const beamAim = aimAfter(tickTime),
+      gunAim = aimAfter(
+        tickTime + Math.min(1.1, d / (gun?.stats.speed ?? 252)),
+      );
+    const full = laser && laser.charge >= laser.stats.charge - 0.055;
+    const cubeBonus =
+      this.config.cubes.damage_per_cube *
+      Math.min(me.cubes, this.config.cubes.stat_cap);
+    let enoughToFinish = false;
+    if (
       laser &&
+      a.kind === "mech" &&
+      a.hp != null &&
+      laser.charge >= laser.stats.min_charge
+    ) {
+      const chargeFraction = Math.min(1, laser.charge / laser.stats.charge);
+      const damageFraction =
+        laser.stats.min_frac + (1 - laser.stats.min_frac) * chargeFraction;
+      enoughToFinish =
+        a.hp <= 0.8 * laser.stats.damage * (1 + cubeBonus) * damageFraction;
+    }
+    const lineUp =
+      allowBeam &&
+      laser &&
+      laser.cooldown <= tickTime &&
       d <= laser.stats.range &&
-      laser.cooldown <= 0.1 &&
-      (laser.charge >= laser.stats.charge - 0.16 || !gun);
-    const flight = beamDue
-      ? 0.035
-      : Math.min(0.95, d / (gun?.stats.speed || 252)) + 0.035;
-    const aimPos = [
-      a.pos[0] + (a.vel?.[0] || 0) * flight,
-      a.pos[1] + (a.vel?.[1] || 0) * flight,
-    ];
-    const bearing = angle(me.pos, aimPos),
-      range = Math.max(1, distance(me.pos, aimPos));
-    const pitch = Math.atan2(
-      a.pos[2] +
-        z +
-        (a.vel?.[2] || 0) * Math.min(flight, 0.22) -
-        me.pos[2] -
-        me.stats.muzzle_height,
-      range,
-    );
-    action.aim = [
-      bearing,
-      clamp(pitch, me.stats.min_pitch, me.stats.max_pitch),
-    ];
-    const yawError = Math.abs(wrap(yaw - bearing)),
-      pitchError = Math.abs(pitch - me.aim[1]);
-    for (let i = 0; i < 2; i++) {
+      (laser.charge >= laser.stats.charge * 0.55 || !gun || enoughToFinish);
+    action.aim = lineUp ? beamAim : gunAim;
+    // Each slot shares one torso. Check where it can actually point on the next physics tick.
+    const nextYaw =
+      yaw +
+      clamp(
+        wrap(action.aim[0] - yaw),
+        -me.stats.turn_rate * tickTime,
+        me.stats.turn_rate * tickTime,
+      );
+    const nextPitch =
+      me.aim[1] +
+      clamp(
+        action.aim[1] - me.aim[1],
+        -me.stats.pitch_rate * tickTime,
+        me.stats.pitch_rate * tickTime,
+      );
+    const radius =
+      a.kind === "mech"
+        ? this.config.mech.radius *
+          (1 + (a.cubes ?? 0) * this.config.cubes.size_per_cube)
+        : a.kind === "npc"
+          ? this.config.npc.radius
+          : this.config.crates.radius;
+    const tolerance = Math.atan2(radius, Math.max(d, 1));
+    const aligned = (angles, slack) =>
+      Math.abs(wrap(nextYaw - angles[0])) < tolerance * slack &&
+      Math.abs(nextPitch - angles[1]) <
+        Math.max(tolerance, Math.atan2(z, d)) * slack;
+    for (let i = 0; i < me.weapons.length; i++) {
       const w = me.weapons[i];
       if (!w) continue;
-      const tolerance = clamp(
-        (a.kind === "crate" ? 1.4 : 2.7) / Math.max(5, d),
-        0.015,
-        0.22,
-      );
-      const onTarget =
-        yawError <= tolerance + 0.07 && pitchError <= tolerance + 0.045;
-      if (w.kind === "gun") action.fire[i] = onTarget && d <= w.stats.range;
-      if (w.kind === "laser")
-        action.fire[i] =
-          d <= w.stats.range &&
-          w.cooldown <= 0.1 &&
-          !(w.charge >= w.stats.charge - 0.055 && onTarget);
+      if (w.kind === "gun")
+        action.fire[i] = d <= w.stats.range && aligned(gunAim, 1.4);
+      if (
+        w.kind === "laser" &&
+        allowBeam &&
+        d <= w.stats.range &&
+        w.cooldown <= 0.1
+      )
+        action.fire[i] = !((full || enoughToFinish) && aligned(beamAim, 1));
       if (w.kind === "lightning")
         action.fire[i] =
-          d < w.stats.range && yawError < (w.stats.cone_deg * Math.PI) / 180;
+          d < w.stats.range &&
+          me.energy >= w.stats.energy &&
+          Math.abs(wrap(nextYaw - beamAim[0])) <
+            (w.stats.cone_deg * Math.PI) / 180;
     }
     if (
       gun &&
@@ -302,7 +387,11 @@ export class Tactics {
         (preparing && target.d > 60 && best.type !== "crates") ||
         (best.kind === "laser" &&
           (!target.engaged || distance(p, best.pos) < 65)) ||
-        (best.type === "cubes" && distance(p, best.pos) < 24) ||
+        (best.type === "cubes" &&
+          distance(p, best.pos) <
+            (me.cubes < 10 && (target.d > 85 || target.a.hp > 250)
+              ? 62
+              : 24)) ||
         best.capture)
     )
       return best;
